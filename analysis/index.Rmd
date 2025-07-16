@@ -17,5 +17,6 @@ This  website contains RNAseq data analyses for the NuMa project.
 
 # Bulk RNAseq data analysis
 
-- [Background and whole experiment analysis](01_introduction.html)<span class="label btn-warning">new report</span>
-
+- [Overview](00_overview.html)<span class="label btn-warning">new report</span>
+- [SENSITIVE vs RESISTANCE](01_SENS_vs_RESIST.html)<span class="label btn-warning">new report</span>
+- [SENSITIVE 23 vs SENSITIVE 24](02_sens23_vs_sens24.html)<span class="label btn-warning">new report</span>
