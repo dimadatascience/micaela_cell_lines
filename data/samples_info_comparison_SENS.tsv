@@ -1,0 +1,7 @@
+sample	sample_description	condition	condition_description	sample_type	sample_group
+S56909_UNT2023	UNT23_1	SENS23	cisplatin_sensitive	t1	1
+Sample_S57670_UNT23B2	UNT23_2	SENS23	cisplatin_sensitive	t1	1
+Sample_S57671_UNT23B3	UNT23_3	SENS23	cisplatin_sensitive	t1	1
+S56910_UNT2024	UNT24_1	SENS24	cisplatin_sensitive	c	1
+Sample_S57672_UNT24B2	UNT24_2	SEN24S	cisplatin_sensitive	c	1
+Sample_S57673_UNT24B3	UNT24_3	SENS24	cisplatin_sensitive	c	1

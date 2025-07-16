@@ -1,0 +1,538 @@
+---
+title: "Introduction to the analysis of bulk RNAseq in NuMA project"
+output:
+  workflowr::wflow_html:
+    toc: true
+    toc_float: true
+    theme: united
+    code_folding: hide
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+author: "Gianluca Alessio Mariani"
+
+params:
+  sample_info_file: "./data/samples_info.tsv"
+  # sample_info_file: "./data/samples_info_test_multbatch.tsv"
+  utils_file: "./src/__utils_rna_seq_functions.R"
+  dds_file: "./data/deseq2.dds.RData"
+  min_sample: 2
+  # logfc: 1
+  # qvalue: 0.05
+---
+
+```{r}
+knitr::opts_chunk$set(echo       = FALSE,
+                      message    = FALSE,
+                      warning    = FALSE,
+                      cache      = FALSE,
+                      autodep    = TRUE,
+                      fig.align  = 'center',
+                      fig.width  = 10,
+                      fig.height = 8)
+```
+
+```{r parameters}
+min_sample = params$min_sample
+# logfc=params$logfc
+# qvalue=params$qvalue
+rdata_file=params$dds_file
+```
+
+## Introduction
+
+Michi fill in
+
+### Overview of the analysis steps
+
+1) Quality control of raw data with [FastQC](https://www.bioinformatics.babraham.ac.uk/projects/fastqc/)
+2) Adapter and quality trimming with [Trim Galore!](https://www.bioinformatics.babraham.ac.uk/projects/trim_galore/)
+3) Read alignment with [STAR](https://github.com/alexdobin/STAR).
+4) Estimation of transcript and gene expression with [Salmon](https://combine-lab.github.io/salmon/).
+5) Differential gene expression analysis with [DESeq2](http://bioconductor.org/packages/devel/bioc/vignettes/DESeq2/inst/doc/DESeq2.html) (v1.49.1)
+6) Gene set enrichment analysis with [ClusterProfiler](https://bioconductor.org/packages/release/bioc/html/clusterProfiler.html) (v4.17.0)
+
+The steps from 1 to 4 have been performed using [nf-core/rnaseq](https://nf-co.re/rnaseq) v3.14.0.
+This report includes analysis from step 5 and 6
+
+```{r libraries}
+source(params$utils_file)
+
+# LIBRARY
+if (!require("DT")) install.packages('DT')
+if (!require("git2r")) install.packages("git2r")
+if (!require("reshape2")) install.packages("reshape2")
+
+library("DESeq2")
+library(rtracklayer)
+library(ComplexHeatmap)
+library(RColorBrewer)
+library(gplots) 
+library(ggplot2)
+library("DT")
+library(reshape)
+library(plotly)
+library(clusterProfiler)
+library(dplyr)
+library(WGCNA)
+library(gridExtra)
+library("git2r")
+library(limma)
+library(tibble)
+library(CorLevelPlot)
+library(ReactomePA)
+```
+
+## Samples Datatable
+
+Below we present the table containing all the samples analyzed in this report.  
+
+Each sample is described by:
+
+  - sample: sample name defined a priori in the previous step of RNA seq analysis
+
+  - sample_description: a descriptive version of the sample name to improve clarity in the presentation of data
+
+  - batch: the experimental batch of each sample
+
+  - condition: the treatment condition (control, knockdown, treated, etc...)
+
+  - condition_description: a descriptive version of the condition to improve clarity in the presentation of data
+
+```{r load_samples, results="asis"}
+
+# Get information
+sample_info <- read.table(params$sample_info_file, header = TRUE, sep = "\t")
+rownames(sample_info) <- sample_info$sample
+
+# Convert to factors
+sample_info[] <- lapply(sample_info, as.factor)
+
+clean_sample_info <- sample_info[, !(colnames(sample_info) %in% c("sample_type", "sample_group"))]
+
+datatable(
+   clean_sample_info,
+   extensions = 'Buttons',   
+   options = list(     
+        dom = 'Blfrtip',     
+        buttons = c('copy', 'csv', 'excel', 'pdf', 'print'),     
+        lengthMenu = list(c(10, 25, 50, -1),                       
+        c(10, 25, 50, "All"))   
+        ),   
+    rownames = FALSE )
+```
+
+```{r sample_grouping, results="asis"}
+deseq_groups <- list()
+
+for (grp in levels(sample_info$sample_group)) {
+  group_samples <- subset(sample_info, sample_group == grp)
+
+  # get control and treatment samples
+  ctrl_samples <- subset(group_samples, sample_type %in% c("c", "tc", "control", "wt", "wild-type", "wildtype"))
+  exp_samples_full <- group_samples[!(group_samples$sample_type %in% ctrl_samples$sample_type), ]
+  comparison = 0
+  if (nrow(exp_samples_full) > 0 && nrow(ctrl_samples) > 0) {
+    
+    # given one control, there might be multiple associated treatments
+    for(treatment in as.vector(unique(exp_samples_full$sample_type))){
+      exp_samples = exp_samples_full[exp_samples_full$sample_type == treatment, ]
+      
+      exp_sample_names <- rownames(exp_samples)
+      ctrl_sample_names <- rownames(ctrl_samples)
+
+      exp_conditions <- unique(exp_samples$condition_description)
+      ctrl_conditions <- unique(ctrl_samples$condition_description)
+
+      exp_conditions_text <- paste(exp_conditions, collapse = ", ")
+      ctrl_conditions_text <- paste(ctrl_conditions, collapse = ", ")
+
+      deseq_groups[[paste0("group_", as.character(grp), "_set_", as.character(comparison))]] <- list(
+        group_id = grp,
+        experimental = exp_sample_names,
+        control = ctrl_sample_names,
+        exp_condition = exp_conditions_text,
+        ctrl_condition = ctrl_conditions_text
+      )
+      comparison = comparison + 1
+    }
+  } else {
+    warning(paste("The group", grp, "does not have a valid comparison (exp + ctrl)"))
+  }
+}
+```
+
+
+
+
+```{r load_data_deseq, results="asis"}
+# Load DESeq2 object containing raw count data
+load(rdata_file)
+
+# Clean names
+sample_info$sample <- make.names(sample_info$sample)
+rownames(sample_info) <- sample_info$sample
+
+# Get common samples
+common_samples <- intersect(colnames(dds), sample_info$sample)
+dds <- dds[, common_samples]
+sample_info <- sample_info[common_samples, ]
+
+# sanity check
+stopifnot(all(colnames(dds) == rownames(sample_info)))
+
+colData(dds)$sample <- sample_info$sample
+colData(dds)$sample_description <- sample_info$sample_description
+colData(dds)$condition <- sample_info$condition
+colData(dds)$condition_description <- sample_info$condition_description
+
+# possible design variables
+design_vars <- c("batch", "condition", "time")  
+
+# Remove constant
+constant_vars <- check_constant_vars(sample_info, design_vars)
+if (length(constant_vars) > 0) {
+  message("Constant variable removed: ", paste(constant_vars, collapse = ", "))
+}
+valid_vars <- setdiff(design_vars, constant_vars)
+if (length(valid_vars) == 0) {
+  stop("No variable for design. condition column is missing or it contains a single condition.")
+}
+
+# Remove missing design variables
+missing_vars = valid_vars[!(valid_vars %in% colnames(sample_info))]
+if (length(missing_vars) > 0) {
+  message("IMPORTANT!!!! missing variable removed: ", paste(missing_vars, collapse = ", "))
+}
+valid_vars <- setdiff(valid_vars, missing_vars)
+if (length(valid_vars) == 0) {
+  stop("No variable for design. condition column is missing or it contains a single condition.")
+}
+
+valid_vars = valid_vars[valid_vars!="batch"]
+design_formula <- as.formula(
+  paste("~", paste(valid_vars, collapse = " + "))
+)
+```
+
+## PCA Analysis
+
+For the PCA (principal component analysis) and correlation analyses, gene expression data were normalized using the variance stabilizing transformation (VST) method implemented in DESeq2.
+
+Below, we present the PCA performed on the complete set of samples. PCA was used to explore global variance in gene expression profiles across all samples.
+
+The primary objectives of this analysis are to:
+
+- Assess sample quality
+
+- Determine whether samples cluster according to experimental conditions, suggesting biologically meaningful variation
+
+- Identify potential outliers
+
+- Detect batch effects or other sources of unwanted variation
+
+By reducing the high-dimensional gene expression data into a few principal components, PCA provides a visual summary of the dataset’s structure.
+
+```{r PCA_all, results="asis"}
+
+counts <- assay(dds)
+min_reads <- round(ncol(counts) / 2)
+min_sample <- length(unique(sample_info$condition))
+
+out <- preprocessing_PCA(counts, 
+    min_reads, 
+    sample_info, 
+    normalization = "vst",
+    min_sample = 5, 
+    design_formula = design_formula,
+    )
+
+rld <- out[["rld"]]
+
+colData(rld)$sample <- sample_info$sample
+colData(rld)$sample_description <- sample_info$sample_description
+colData(rld)$condition <- sample_info$condition
+colData(rld)$condition_description <- sample_info$condition_description
+
+sample_names <- colnames(rld)  
+alt_labels <- colData(rld)$sample_description 
+name_map <- setNames(as.character(alt_labels), sample_names)
+
+p <- mypcaAnalysis_test(
+  title_1vs2 = "Analysis on all samples", 
+  rld = rld,
+  intgroup1 = "condition_description",
+  intgroup2 = "batch"
+)
+
+p
+```
+
+```{r batch_effect, results="asis", echo=FALSE}
+
+# n_batches <- length(unique(sample_info$batch))
+# var_threshold <- 0.1
+# pval_threshold <- 0.05
+
+# do_batch_correction <- FALSE  # default: no correction
+
+# if (n_batches > 1) {
+#   check <- check_batch_effect(rld, batch_var = "batch", cond_var = "condition_description", var_threshold = var_threshold)
+#   confound_check <- check_batch_condition_confounding(sample_info, batch_var = "batch", cond_var = "condition_description", pval_threshold = pval_threshold)
+  
+#   batch_var_exp_pct <- round(check$batch_var_exp * 100, 2)
+#   threshold_pct <- var_threshold * 100
+  
+#   warning_msg <- ""
+#   if (!is.null(confound_check$warning)) {
+#     warning_msg <- paste0(confound_check$warning, "<br><br>")
+#   }
+  
+#   if (confound_check$confounded) {
+#     batch_text <- paste0(
+#       "Samples come from ", n_batches, " different batches.<br><br>",
+#       "The independence test between batch and condition indicates a strong association (p-value = ",
+#       signif(confound_check$p_value, 3), ").<br>",
+#       "This suggests that batch and condition are confounded, and batch correction might remove true biological signal.<br><br>",
+#       "Therefore, batch correction <b>IS DISCOURAGED</b> to avoid introducing artifacts."
+#     )
+#     do_batch_correction <- FALSE
+    
+#   } else if (check$batch_significant) {
+#     batch_text <- paste0(
+#       "Samples come from ", n_batches, " different batches.<br>",
+#       "The variance explained by batch in the first two principal components is approximately <b>", batch_var_exp_pct, "%</b>, exceeding the threshold of <b>", threshold_pct, "%</b>.<br>",
+#       "Batch correction <b>IS SUGGESTED</b>."
+#     )
+#     do_batch_correction <- TRUE
+    
+#   } else {
+#     batch_text <- paste0(
+#       "Samples come from ", n_batches, " batches.<br>",
+#       "The variance explained by batch is low (", batch_var_exp_pct, "%), below the threshold of ", threshold_pct, "%.<br>",
+#       "Batch correction <b>IS DISCOURAGED</b> to preserve true biological signal."
+#     )
+#     do_batch_correction <- FALSE
+#   }
+  
+#   # Print output only if batch correction is suggested or there is a warning
+#   if (do_batch_correction || warning_msg != "") {
+#     cat("### Batch Effect Correction\n\n")
+#     cat(batch_text)
+#     cat("\n\n")
+#     cat(warning_msg)
+#   }
+  
+# } else {
+#   # Only one batch, no batch effect, no output
+#   do_batch_correction <- FALSE
+# }
+
+```
+
+<div style="color:red;">
+
+### Interpretation PCA Analysis and evaluation of batch effect
+
+The PCA analysis reveals well-defined clusters corresponding to all four conditions. We conclude that:
+
+- The samples were properly collected.
+
+- The samples show good quality.
+
+- No evident outlier samples were detected.
+
+- The variation between conditions is greater between NS and S samples (PC1: 44.5%) than between experiment and control within the same condition (PC2: 20.5%).
+
+- All samples have been collected in the same batch, so batch effect is not present.
+
+</div>
+
+## Correlation analysis
+
+The Spearman correlation heatmap provides a global view of the similarity between gene expression profiles across all samples.
+We calculated the pairwise Spearman correlation coefficients between samples and visualized them in a heatmap.
+Rows and columns are hierarchically clustered based on these correlations to reveal patterns of similarity and potential groupings among samples.
+
+```{r heatmap_correlation, results="asis"}
+
+# Corellation between samples
+cor_matrix <- cor(assay(rld), method = "spearman")
+colnames(cor_matrix) <- name_map[colnames(cor_matrix)]
+rownames(cor_matrix) <- name_map[rownames(cor_matrix)]
+
+# Distance matrix defined as 1-correlation
+clustering_dist <- as.dist(1 - cor_matrix)
+
+# Annotate groups
+annotation_df <- as.data.frame(colData(dds)[, "condition_description", drop = FALSE])
+colnames(annotation_df) <- "Condition"
+rownames(annotation_df) <- name_map[rownames(annotation_df)]
+
+# Unique conditions
+conditions <- unique(as.character(colData(dds)$condition_description))
+n_conditions <- length(conditions)
+
+# Color palette
+palette_colors <- brewer.pal(min(n_conditions, 8), "Set2")
+palette_colors <- palette_colors[seq_len(n_conditions)]
+
+if (n_conditions > length(palette_colors)) {
+  palette_colors <- colorRampPalette(brewer.pal(8, "Set2"))(n_conditions)
+}
+
+# color mapping
+annotation_colors <- list(
+  Condition = setNames(palette_colors, conditions)
+)
+```
+
+### **Spearman Correlation: General Interpretation**
+
+####  **High Correlation Values** (> 0.98)  
+*Between replicates of the same condition:*  
+
+  - A very good quality signal  
+
+  - Indicates that replicates behave consistently  
+
+  - Suggests well-defined and reproducible biological conditions  
+
+*Between different conditions:*  
+
+  - May indicate minor transcriptional differences  
+
+  - Or poor separation due to contamination or mislabeling
+
+#### **Lower Correlation Values** (< 0.95)  
+*Between replicates of the same condition:* 
+
+  - May suggest technical or biological issues:  
+
+    - Library prep/sequencing errors  
+
+    - Sample mix-up or mislabeling  
+
+    - Biological heterogeneity  
+
+In some cases, biological replicates may exhibit a certain degree of variability that cannot be entirely avoided. 
+This is particularly true when samples are obtained from different individuals, such as patient-derived samples, even when all other experimental conditions are carefully controlled.
+
+Therefore, lower correlation values between replicates should not be interpreted in a standardized way, but rather evaluated in the specific biological and experimental context of the study.
+
+*Between different conditions:*  
+
+  - Expected when conditions are biologically distinct  
+
+  - If correlations are too similar to replicates, it may suggest:  
+
+    - Weak treatment effects  
+
+    - Few genes affected by the condition  
+
+
+### Spearman Correlation Heatmap
+
+Below we present the heatmap associated spearman correlation.
+
+```{r heatmap_correlation_plot, fig.width=8, fig.height=6}
+
+pheatmap(
+  cor_matrix,
+  clustering_distance_rows = clustering_dist,
+  clustering_distance_cols = clustering_dist,
+  annotation_col = annotation_df,
+  annotation_colors = annotation_colors,
+  main = "Sample-to-sample correlation (Spearman)",
+  display_numbers = TRUE,
+  number_format = "%.2f",
+  fontsize_number = 7,
+  cellheight = 14,
+  cellwidth = 14
+)
+```
+
+<div style="color:red;">
+
+### Interpretation Spearman Correlation Heatmap
+
+The correlation heatmap shows expected results:
+
+- Samples cluster according to their respective conditions.
+
+- Correlation values are consistent:
+  - Higher correlations between replicates (≥ 0.98).
+  - Lower correlations between different conditions (0.96–0.97). 
+  
+Although the correlation between the different conditions is not very low, this may not indicate an issue with the sample collection. Instead, it could suggest a lack of significant differences between the two conditions under consideration, which would be reflected in a smaller number of differentially expressed genes (DEGs) detected.
+
+</div>
+
+## Library Sizes
+
+A bar plot displaying total read counts per sample is shown below
+
+```{r counts_dds, results="asis", fig.width=8}
+
+lib_sizes <- data.frame(
+  sample_description = colData(dds)$sample_description,
+  total_counts = colSums(counts(dds))
+)
+
+# Plot
+ggplot(lib_sizes, aes(x = sample_description, y = total_counts)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  theme_minimal() +
+  labs(title = "",
+       x = "Sample",
+       y = "Total Counts") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+<div style="color:red;">
+
+### Interpretation Library Sizes
+
+Library sizes are comparable across samples, indicating no imbalanced pooling during library sample collection.
+
+</div>
+
+## Violin plot of VST-normalized counts
+
+Below we present a violin plot of the VST-normalized read counts by sample.
+
+A violin plot of VST-normalized counts provides an overview of the global distribution of gene expression values across samples after normalization.  This plot allows for the detection of potential outliers, technical biases, or inconsistencies in distribution across samples, which could affect downstream analyses. A consistent distribution of VST counts across samples suggests successful normalization and comparable expression profiles.
+
+```{r violin_dds, results="asis", fig.width=8, fig.height=5}
+
+rld_matrix <- assay(rld)
+df_long <- reshape2::melt(rld_matrix, varnames = c("gene", "sample"), value.name = "expression")
+
+df_long$sample <- name_map[as.character(df_long$sample)]
+
+
+ggplot(df_long, aes(x = sample, y = expression)) +
+  geom_violin(trim = FALSE, fill = "#8da0cb", color = "black") +
+  geom_boxplot(width = 0.1, outlier.size = 0.5) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 60, hjust = 1),
+    axis.title.x = element_blank()
+  ) +
+  labs(
+    y = "VST-normalized expression",
+    title = ""
+  )
+```
+
+<div style="color:red;">
+
+### Interpretation Violin plot of VST-normalized counts
+
+The violin plot of counts data displays a consistent distribution of VST counts across samples.  
+This indicates no substantial differences in gene expression profiles between the conditions and confirms the quality and reliability of the samples, supporting the inclusion of all samples in subsequent analyses.
+
+</div>
+
+## Differential expression analysis
+
+The report with specific comparisons can be found here:
+
